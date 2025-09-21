@@ -1,112 +1,272 @@
-import logging
-from livekit.agents import function_tool, RunContext
-import requests
-from langchain_community.tools import DuckDuckGoSearchRun
 import os
-import smtplib
-from email.mime.multipart import MIMEMultipart  
+import logging
+import aiohttp
+import asyncio
+import base64
+from typing import List, Optional
 from email.mime.text import MIMEText
-from typing import Optional
+from livekit.agents import function_tool, RunContext
+from langchain_community.tools import DuckDuckGoSearchRun
+from google_auth_helper import get_access_token
 
+
+# -------------------------
+# Weather Tool
+# -------------------------
 @function_tool()
-async def get_weather(
-    context: RunContext,  # type: ignore
-    city: str) -> str:
+async def get_weather(context: RunContext, city: str) -> str:
     """
-    Get the current weather for a given city.
+    Fetch current weather for a given city using OpenWeather API.
     """
     try:
-        response = requests.get(
-            f"https://wttr.in/{city}?format=3")
-        if response.status_code == 200:
-            logging.info(f"Weather for {city}: {response.text.strip()}")
-            return response.text.strip()   
-        else:
-            logging.error(f"Failed to get weather for {city}: {response.status_code}")
-            return f"Could not retrieve weather for {city}."
+        api_key = os.getenv("OPENWEATHER_API_KEY")
+        if not api_key:
+            return "Weather API key missing in .env"
+
+        url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={api_key}&units=metric"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return f"Failed to fetch weather for {city}."
+                data = await resp.json()
+                desc = data["weather"][0]["description"]
+                temp = data["main"]["temp"]
+                return f"Weather in {city}: {desc}, {temp}°C"
     except Exception as e:
-        logging.error(f"Error retrieving weather for {city}: {e}")
-        return f"An error occurred while retrieving weather for {city}." 
+        logging.error(f"get_weather error: {e}")
+        return f"Error fetching weather for {city}"
 
+
+# -------------------------
+# Web Search Tool
+# -------------------------
 @function_tool()
-async def search_web(
-    context: RunContext,  # type: ignore
-    query: str) -> str:
+async def search_web(context: RunContext, query: str) -> str:
     """
-    Search the web using DuckDuckGo.
+    Perform a web search using DuckDuckGo.
     """
     try:
-        results = DuckDuckGoSearchRun().run(tool_input=query)
-        logging.info(f"Search results for '{query}': {results}")
+        results = await asyncio.to_thread(DuckDuckGoSearchRun().run, query)
         return results
     except Exception as e:
-        logging.error(f"Error searching the web for '{query}': {e}")
-        return f"An error occurred while searching the web for '{query}'."    
+        logging.error(f"search_web error: {e}")
+        return f"Error searching the web for '{query}'"
 
-@function_tool()    
+
+# -------------------------
+# Gmail Tool
+# -------------------------
+@function_tool()
 async def send_email(
-    context: RunContext,  # type: ignore
+    context: RunContext,
     to_email: str,
     subject: str,
     message: str,
-    cc_email: Optional[str] = None
+    cc_email: Optional[List[str]] = None
 ) -> str:
     """
-    Send an email through Gmail.
-    
-    Args:
-        to_email: Recipient email address
-        subject: Email subject line
-        message: Email body content
-        cc_email: Optional CC email address
+    Send an email using Gmail API.
     """
     try:
-        # Gmail SMTP configuration
-        smtp_server = "smtp.gmail.com"
-        smtp_port = 587
-        
-        # Get credentials from environment variables
-        gmail_user = os.getenv("GMAIL_USER")
-        gmail_password = os.getenv("GMAIL_APP_PASSWORD")  # Use App Password, not regular password
-        
-        if not gmail_user or not gmail_password:
-            logging.error("Gmail credentials not found in environment variables")
-            return "Email sending failed: Gmail credentials not configured."
-        
-        # Create message
-        msg = MIMEMultipart()
-        msg['From'] = gmail_user
-        msg['To'] = to_email
-        msg['Subject'] = subject
-        
-        # Add CC if provided
-        recipients = [to_email]
+        access_token = get_access_token()
+        if not access_token:
+            return "Google access token unavailable."
+
+        mime_msg = MIMEText(message)
+        mime_msg["to"] = to_email
+        mime_msg["subject"] = subject
         if cc_email:
-            msg['Cc'] = cc_email
-            recipients.append(cc_email)
-        
-        # Attach message body
-        msg.attach(MIMEText(message, 'plain'))
-        
-        # Connect to Gmail SMTP server
-        server = smtplib.SMTP(smtp_server, smtp_port)
-        server.starttls()  # Enable TLS encryption
-        server.login(gmail_user, gmail_password)
-        
-        # Send email
-        text = msg.as_string()
-        server.sendmail(gmail_user, recipients, text)
-        server.quit()
-        
-        logging.info(f"Email sent successfully to {to_email}")
-        return f"Email sent successfully to {to_email}"
-        
-    except smtplib.SMTPAuthenticationError:
-        logging.error("Gmail authentication failed")
-        return "Email sending failed: Authentication error. Please check your Gmail credentials."
-    except smtplib.SMTPException as e:
-        logging.error(f"SMTP error occurred: {e}")
-        return f"Email sending failed: SMTP error - {str(e)}"
+            mime_msg["cc"] = ", ".join(cc_email)
+
+        raw_msg = base64.urlsafe_b64encode(mime_msg.as_bytes()).decode()
+
+        url = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+        payload = {"raw": raw_msg}
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload) as resp:
+                if resp.status in [200, 201]:
+                    return f"Email sent to {to_email}"
+                else:
+                    text = await resp.text()
+                    logging.error(f"Gmail API error: {text}")
+                    return f"Failed to send email: {text}"
+
     except Exception as e:
-        logging.error(f"Error sending email: {e}")
-        return f"An error occurred while sending email: {str(e)}"
+        logging.error(f"send_email error: {e}")
+        return f"Error sending email: {e}"
+
+
+# -------------------------
+# Google Calendar Tools
+# -------------------------
+@function_tool()
+async def create_calendar_event(
+    context: RunContext,
+    summary: str,
+    start_time: str,
+    end_time: str,
+    attendees: Optional[List[str]] = None,
+    description: str = ""
+) -> str:
+    """
+    Create a new Google Calendar event.
+    """
+    try:
+        access_token = get_access_token()
+        if not access_token:
+            return "Google access token unavailable."
+
+        event = {
+            "summary": summary,
+            "description": description,
+            "start": {"dateTime": start_time, "timeZone": "Asia/Kolkata"},
+            "end": {"dateTime": end_time, "timeZone": "Asia/Kolkata"},
+        }
+        if attendees:
+            event["attendees"] = [{"email": email} for email in attendees]
+
+        url = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=event) as resp:
+                if resp.status in [200, 201]:
+                    data = await resp.json()
+                    return f"Event created: {data.get('htmlLink','No link')}"
+                else:
+                    text = await resp.text()
+                    logging.error(f"Calendar API error: {text}")
+                    return f"Failed to create event: {text}"
+
+    except Exception as e:
+        logging.error(f"create_calendar_event error: {e}")
+        return f"Error creating calendar event: {e}"
+
+
+@function_tool()
+async def list_upcoming_events(context: RunContext, max_results: int = 5) -> str:
+    """
+    List upcoming events from the primary Google Calendar.
+    """
+    try:
+        access_token = get_access_token()
+        if not access_token:
+            return "Google access token unavailable."
+
+        import datetime
+        now = datetime.datetime.utcnow().isoformat() + "Z"
+        url = (
+            "https://www.googleapis.com/calendar/v3/calendars/primary/events"
+            f"?maxResults={max_results}&timeMin={now}&singleEvents=true&orderBy=startTime"
+        )
+        headers = {"Authorization": f"Bearer {access_token}"}
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    events = data.get("items", [])
+                    if not events:
+                        return "No upcoming events found."
+                    response = ""
+                    for ev in events:
+                         start = ev["start"].get("dateTime", ev["start"].get("date"))
+                         response += f"- {ev['summary']} at {start} (ID: {ev['id']})\n"
+                    return response.strip()
+                else:
+                    text = await resp.text()
+                    logging.error(f"Calendar API error: {text}")
+                    return f"Failed to list events: {text}"
+
+    except Exception as e:
+        logging.error(f"list_upcoming_events error: {e}")
+        return f"Error fetching events: {e}"
+
+@function_tool()
+async def delete_calendar_event(context: RunContext, event_id: str) -> str:
+    """
+    Delete an event from the primary Google Calendar by event ID.
+    """
+    try:
+        access_token = get_access_token()
+        if not access_token:
+            return "Google access token unavailable."
+
+        url = f"https://www.googleapis.com/calendar/v3/calendars/primary/events/{event_id}"
+        headers = {"Authorization": f"Bearer {access_token}"}
+
+        async with aiohttp.ClientSession() as session:
+            async with session.delete(url, headers=headers) as resp:
+                if resp.status == 204:  # 204 = No Content (successful deletion)
+                    return f"Event {event_id} deleted successfully."
+                else:
+                    text = await resp.text()
+                    logging.error(f"Calendar API error: {text}")
+                    return f"Failed to delete event {event_id}: {text}"
+
+    except Exception as e:
+        logging.error(f"delete_calendar_event error: {e}")
+        return f"Error deleting event: {e}"
+@function_tool()
+async def delete_event_by_name(context: RunContext, event_name: str) -> str:
+    """
+    Delete a Google Calendar event by its name (summary).
+    If multiple matches are found, returns them for clarification.
+    """
+    try:
+        access_token = get_access_token()
+        if not access_token:
+            return "Google access token unavailable."
+
+        import datetime
+        now = datetime.datetime.utcnow().isoformat() + "Z"
+        url = (
+            "https://www.googleapis.com/calendar/v3/calendars/primary/events"
+            f"?timeMin={now}&singleEvents=true&orderBy=startTime"
+        )
+        headers = {"Authorization": f"Bearer {access_token}"}
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    logging.error(f"Calendar API error: {text}")
+                    return f"Failed to search events: {text}"
+                
+                data = await resp.json()
+                events = data.get("items", [])
+                matches = [ev for ev in events if event_name.lower() in ev["summary"].lower()]
+
+                if not matches:
+                    return f"No events found with name containing '{event_name}'."
+
+                if len(matches) > 1:
+                    response = "Multiple events match:\n"
+                    for ev in matches:
+                        start = ev["start"].get("dateTime", ev["start"].get("date"))
+                        response += f"- {ev['summary']} at {start} (ID: {ev['id']})\n"
+                    response += "Please specify the ID of the event to delete."
+                    return response
+
+                # Only one match → delete directly
+                event_id = matches[0]["id"]
+                delete_url = f"https://www.googleapis.com/calendar/v3/calendars/primary/events/{event_id}"
+                async with session.delete(delete_url, headers=headers) as delete_resp:
+                    if delete_resp.status == 204:
+                        return f"Event '{matches[0]['summary']}' deleted successfully."
+                    else:
+                        text = await delete_resp.text()
+                        logging.error(f"Calendar delete error: {text}")
+                        return f"Failed to delete event: {text}"
+
+    except Exception as e:
+        logging.error(f"delete_event_by_name error: {e}")
+        return f"Error deleting event by name: {e}"
